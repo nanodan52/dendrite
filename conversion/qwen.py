@@ -469,6 +469,21 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         shape = list(tensor.shape)
         if dim < 0:
             dim += len(shape)
+
+        # LoRA tensors (W ≈ B @ A) cannot reshape their row dimension.
+        # Instead, build a permutation index and apply it to A (column reorder) or B (row reorder) directly.
+        if hasattr(tensor, 'get_lora_A_B'):
+            n = shape[dim]
+            idx = torch.arange(n).reshape(num_k_heads, num_v_per_k, head_dim)
+            idx = idx.permute(1, 0, 2).contiguous().reshape(n)
+            lora_A, lora_B = tensor.get_lora_A_B()  # ty: ignore[call-non-callable]
+            if dim == len(shape) - 1:
+                return type(tensor)(lora_A[:, idx], lora_B)
+            elif dim == 0:
+                return type(tensor)(lora_A, lora_B[idx])
+            else:
+                raise NotImplementedError(f"_reorder_v_heads on dim={dim} not supported for LoRA tensors")
+
         new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1:]
         tensor = tensor.reshape(*new_shape)
         perm = list(range(len(new_shape)))
@@ -714,6 +729,12 @@ class DFlashModel(Qwen3Model):
         embedding_scale = dflash_config.get(
             "input_embedding_scale", self.hparams.get("input_embedding_scale")
         )
+        if embedding_scale is None and self.target_model_dir is not None:
+            # the draft shares the target's token embeddings, and Gemma scales them by sqrt(hidden_size) in the forward pass
+            target_hparams = ModelBase.load_hparams(self.target_model_dir, False)
+            if get_model_architecture(target_hparams, ModelType.TEXT).startswith("Gemma"):
+                target_hparams = {**target_hparams, **target_hparams.get("text_config", {})}
+                embedding_scale = target_hparams["hidden_size"] ** 0.5
         if embedding_scale is not None:
             self.gguf_writer.add_embedding_scale(float(embedding_scale))
 
